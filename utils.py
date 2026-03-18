@@ -43,146 +43,190 @@ class HandTracker:
 def preprocess_gesture(points, canvas_size=(128, 128)):
     """
     Preprocesses the drawn points into a format suitable for the CNN+ViT model.
+    Fixed: preserves aspect ratio, keeps ALL drawn features (internal details),
+    uses consistent stroke thickness matching training data.
     """
-    if not points:
+    if not points or len(points) < 2:
         return None
-    
-    # Create a blank black image
+
+    # Create a blank black image matching webcam resolution
     mask = np.zeros((480, 640), dtype=np.uint8)
-    
-    # Draw the points as lines (Gesture Contour Detection)
+
+    # Draw with consistent thickness (matches training data median of 2-6)
+    thickness = 4
     for i in range(1, len(points)):
         if points[i-1] is not None and points[i] is not None:
-            cv2.line(mask, points[i-1], points[i], 255, 5)
-    
-    # Find contours to isolate the shape
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+            cv2.line(mask, points[i-1], points[i], 255, thickness)
+
+    # Use findNonZero to get bounding box of ALL drawn pixels
+    # (unlike findContours which only gets the largest contour and loses
+    # internal features like smiley face eyes, music note stems, etc.)
+    nonzero = cv2.findNonZero(mask)
+    if nonzero is None:
         return None
-    
-    # Get the largest contour (the shape)
-    cnt = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(cnt)
-    
-    # Add padding
-    pad = 10
+
+    x, y, w, h = cv2.boundingRect(nonzero)
+
+    # Skip if too small
+    if w < 10 or h < 10:
+        return None
+
+    # Add generous proportional padding
+    pad = max(15, max(w, h) // 6)
     x = max(0, x - pad)
     y = max(0, y - pad)
     w = min(mask.shape[1] - x, w + 2 * pad)
     h = min(mask.shape[0] - y, h + 2 * pad)
-    
-    # Crop and resize
+
+    # Crop
     roi = mask[y:y+h, x:x+w]
-    roi = cv2.resize(roi, canvas_size)
-    
+
+    # CRITICAL: Preserve aspect ratio by padding to square before resize
+    max_dim = max(roi.shape[0], roi.shape[1])
+    square = np.zeros((max_dim, max_dim), dtype=np.uint8)
+    y_off = (max_dim - roi.shape[0]) // 2
+    x_off = (max_dim - roi.shape[1]) // 2
+    square[y_off:y_off+roi.shape[0], x_off:x_off+roi.shape[1]] = roi
+
+    # Resize to model input size with high-quality interpolation
+    roi = cv2.resize(square, canvas_size, interpolation=cv2.INTER_AREA)
+
     # Normalize
     roi = roi.astype('float32') / 255.0
-    roi = np.expand_dims(roi, axis=-1) # Add channel dimension
-    roi = np.expand_dims(roi, axis=0)  # Add batch dimension
-    
+    roi = np.expand_dims(roi, axis=-1)  # Add channel dimension
+    roi = np.expand_dims(roi, axis=0)   # Add batch dimension
+
     return roi
 
 def heuristic_classify(points):
     """
     Heuristic classification fallback for the 12 creative shapes.
-    Uses geometric properties and contour analysis to make best guesses.
+    Uses geometric properties, path analysis, and contour features.
     """
     if not points or len(points) < 10:
         return "Spiral", 0.4
-    
+
     mask = np.zeros((480, 640), dtype=np.uint8)
     for i in range(1, len(points)):
         if points[i-1] is not None and points[i] is not None:
-            cv2.line(mask, points[i-1], points[i], 255, 5)
-    
+            cv2.line(mask, points[i-1], points[i], 255, 4)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return "Spiral", 0.4
-    
+
     cnt = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(cnt)
     peri = cv2.arcLength(cnt, True)
-    
+
     if area < 100:
         return "Spiral", 0.4
-    
+
     approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
     num_vertices = len(approx)
-    
+
     x, y, w, h = cv2.boundingRect(cnt)
     aspect_ratio = float(w) / h if h > 0 else 1
-    
-    # Convex Hull
+
     hull = cv2.convexHull(cnt)
     hull_area = cv2.contourArea(hull)
     solidity = float(area) / hull_area if hull_area > 0 else 1
-    
-    # Circularity
     circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
-    
-    # Count contour components (for multi-part shapes)
-    all_contours = contours
-    num_contours = len(all_contours)
-    
-    # Check if the path is open (non-closed) — characteristic of spiral, lightning, music note
-    pts_array = np.array(points)
+
+    num_contours = len(contours)
+
+    pts_array = np.array(points, dtype=np.float32)
     start_end_dist = np.linalg.norm(pts_array[0] - pts_array[-1])
     max_extent = max(w, h)
-    is_open = start_end_dist > max_extent * 0.3
-    
-    # Heuristic Decision Tree for 12 creative shapes
-    
-    # Smiley face: round with high circularity, multiple contour components (eyes inside)
-    if circularity > 0.6 and aspect_ratio > 0.7 and aspect_ratio < 1.4:
-        return "Smiley face", 0.7
-    
-    # Lightning bolt: very elongated, open path, zigzag pattern (low solidity)
-    if aspect_ratio < 0.5 or aspect_ratio > 2.0:
-        if is_open and solidity < 0.7:
-            return "Lightning bolt", 0.7
-    
-    # Spiral: open path, curving, moderate solidity
-    if is_open and circularity < 0.3:
-        return "Spiral", 0.65
-    
-    # Infinity: wide aspect ratio, figure-8 like, closed
-    if aspect_ratio > 1.5 and not is_open and solidity > 0.5:
-        return "Infinity", 0.6
-    
-    # Flower: multiple bumps, moderate solidity
-    if num_contours > 2 or (solidity < 0.6 and circularity > 0.2):
+    is_open = start_end_dist > max_extent * 0.25
+    is_closed = not is_open
+
+    # Path-based features
+    # Radius progression (spiral detection: monotonic radius change)
+    centroid = np.mean(pts_array, axis=0)
+    radii = np.sqrt(np.sum((pts_array - centroid) ** 2, axis=1))
+    radius_trend = 0.0
+    if len(radii) > 5:
+        radius_trend = float(np.corrcoef(np.arange(len(radii)), radii)[0, 1])
+
+    # Self-crossing count (infinity, butterfly detection)
+    crossings = 0
+    n_pts = len(pts_array)
+    if n_pts > 10:
+        step = max(1, n_pts // 40)
+        for i in range(0, n_pts - 3, step):
+            for j in range(i + 3, min(n_pts - 1, i + 25), step):
+                p1, p2 = pts_array[i], pts_array[i+1]
+                p3, p4 = pts_array[j], pts_array[j+1]
+                d1 = (p4[0]-p3[0])*(p1[1]-p3[1]) - (p4[1]-p3[1])*(p1[0]-p3[0])
+                d2 = (p4[0]-p3[0])*(p2[1]-p3[1]) - (p4[1]-p3[1])*(p2[0]-p3[0])
+                d3 = (p2[0]-p1[0])*(p3[1]-p1[1]) - (p2[1]-p1[1])*(p3[0]-p1[0])
+                d4 = (p2[0]-p1[0])*(p4[1]-p1[1]) - (p2[1]-p1[1])*(p4[0]-p1[0])
+                if d1 * d2 < 0 and d3 * d4 < 0:
+                    crossings += 1
+
+    # Angular change analysis (zigzag detection for lightning, crown)
+    angles = []
+    step_a = max(1, n_pts // 30)
+    for i in range(step_a, n_pts - step_a, step_a):
+        v1 = pts_array[i] - pts_array[i - step_a]
+        v2 = pts_array[i + step_a] - pts_array[i]
+        dot = np.dot(v1, v2)
+        cross = v1[0]*v2[1] - v1[1]*v2[0]
+        angle = abs(np.arctan2(cross, dot))
+        angles.append(angle)
+    sharp_turns = sum(1 for a in angles if a > np.pi * 0.4)
+
+    # Decision tree with discriminative features
+
+    # Spiral: open path with monotonically changing radius
+    if is_open and abs(radius_trend) > 0.5 and crossings < 3:
+        return "Spiral", 0.75
+
+    # Infinity: closed-ish, has self-crossings, wider than tall
+    if crossings > 3 and aspect_ratio > 1.2 and abs(radius_trend) < 0.4:
+        return "Infinity", 0.7
+
+    # Lightning bolt: open, vertical, sharp zigzag turns
+    if is_open and sharp_turns >= 2 and (aspect_ratio < 0.6 or aspect_ratio > 1.8):
+        return "Lightning bolt", 0.7
+
+    # Smiley face: round, closed, high circularity
+    if circularity > 0.5 and is_closed and 0.7 < aspect_ratio < 1.4:
+        return "Smiley face", 0.65
+
+    # Crown: wide, has sharp peaks on top, closed
+    if aspect_ratio > 1.2 and sharp_turns >= 3 and is_closed:
+        return "Crown", 0.6
+
+    # Music note: open, has a round part and a line part
+    if is_open and aspect_ratio < 1.0 and n_pts > 30:
+        return "Music note", 0.55
+
+    # Butterfly: has 4-way symmetry with crossings
+    if crossings > 1 and 0.7 < aspect_ratio < 1.5 and solidity < 0.6:
+        return "Butterfly", 0.6
+
+    # Flower: lobed/bumpy closed curve
+    if is_closed and num_vertices > 8 and solidity < 0.7:
         return "Flower", 0.6
-    
-    # Butterfly: wide, symmetric, low-moderate solidity
-    if aspect_ratio > 1.2 and solidity < 0.65:
-        return "Butterfly", 0.55
-    
-    # Crown: wider than tall, zigzag top
-    if aspect_ratio > 1.3 and num_vertices > 5 and num_vertices < 15:
-        return "Crown", 0.55
-    
-    # Fish: elongated ellipse with tail
-    if aspect_ratio > 1.5 and solidity > 0.6:
+
+    # Fish: elongated, closed
+    if aspect_ratio > 1.5 and is_closed and solidity > 0.5:
         return "Fish", 0.55
-    
-    # Leaf: elongated, pointed ends
-    if aspect_ratio > 1.3 or aspect_ratio < 0.7:
-        if solidity > 0.7:
-            return "Leaf", 0.55
-    
-    # Flame: taller than wide, tapered top
+
+    # Leaf: elongated, closed, high solidity
+    if (aspect_ratio > 1.3 or aspect_ratio < 0.7) and solidity > 0.65:
+        return "Leaf", 0.55
+
+    # Flame: taller than wide, tapered
     if aspect_ratio < 0.8 and solidity > 0.5:
         return "Flame", 0.55
-    
-    # Music note: open path, small area
-    if is_open and area < hull_area * 0.5:
-        return "Music note", 0.5
-    
-    # Cloud: round-ish, bumpy
-    if circularity > 0.3 and solidity > 0.6:
+
+    # Cloud: bumpy closed curve, moderate circularity
+    if is_closed and circularity > 0.25 and solidity > 0.55:
         return "Cloud", 0.5
-    
-    # Default fallback
+
     return "Spiral", 0.4
 
 
