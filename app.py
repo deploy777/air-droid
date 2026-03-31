@@ -280,14 +280,6 @@ st.sidebar.markdown("---")
 demo_mode = st.sidebar.checkbox("Use Heuristic Fallback", value=False, help="Uses geometric heuristics instead of the AI model. AI model is more advanced (CNN+Transformer).")
 use_tta = st.sidebar.checkbox("Use Test-Time Augmentation", value=True, help="Averages multiple predictions for more robust classification. Slightly slower but more accurate.")
 
-if st.sidebar.button("🚀 Re-Train AI Model"):
-    with st.spinner("Generating data and training CNN+Transformer... This may take a few minutes."):
-        from model import train_model
-        train_model()
-        st.cache_resource.clear()
-        st.success("✅ Model trained and loaded!")
-        st.rerun()
-
 st.sidebar.markdown("---")
 # Convert hex to RGB
 hex_color = color_picker.lstrip('#')

@@ -1117,22 +1117,20 @@ def train_model():
 
 
 def load_model():
-    """Load the trained model or train a new one if not found."""
-    if os.path.exists(MODEL_PATH):
-        try:
-            return tf.keras.models.load_model(
-                MODEL_PATH,
-                custom_objects={
-                    'TransformerBlock': TransformerBlock,
-                    'PatchEmbedding': PatchEmbedding,
-                    'SqueezeExcitation': SqueezeExcitation,
-                    'StochasticDepth': StochasticDepth,
-                    'WarmupCosineDecay': WarmupCosineDecay,
-                }
-            )
-        except Exception as e:
-            print(f"Failed to load model: {e}")
-            print("Retraining...")
-            return train_model()
-    else:
-        return train_model()
+    """Load the pre-trained model. Raises a clear error if the model file is missing."""
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Model file '{MODEL_PATH}' not found. "
+            "Make sure you cloned the repo with Git LFS: "
+            "git lfs install && git lfs pull"
+        )
+    return tf.keras.models.load_model(
+        MODEL_PATH,
+        custom_objects={
+            'TransformerBlock': TransformerBlock,
+            'PatchEmbedding': PatchEmbedding,
+            'SqueezeExcitation': SqueezeExcitation,
+            'StochasticDepth': StochasticDepth,
+            'WarmupCosineDecay': WarmupCosineDecay,
+        }
+    )

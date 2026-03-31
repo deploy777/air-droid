@@ -1,42 +1,50 @@
-# AI-Air-Drawing-Shape-Detection
+# AI Air Drawing — Creative Shape Detector
 
- 
-model.py
- — Complete Rewrite
-Removed all 10 geometrical shapes: Circle, Square, Rectangle, Triangle, Pentagon, Hexagon, Heptagon, Octagon, Star, Ellipse
-Kept only 12 creative shapes: Spiral, Infinity, Cloud, Lightning bolt, Flower, Butterfly, Crown, Flame, Fish, Leaf, Music note, Smiley face
-Enhanced CNN architecture: 4 convolutional blocks (was 3) with BatchNormalization for better training stability
-Added 
-PatchEmbedding
- layer: Learned positional encoding for the Transformer — boosts spatial awareness
-3 Transformer blocks (was 2) for deeper global attention
-Richer classification head: 256 → 128 → 12 with LayerNorm and Dropout
-Cosine learning rate decay for smoother convergence
-Heavy data augmentation: Random rotation (±20°), scaling (0.85–1.15x), translation (±8px), noise, dilation/erosion
-500 samples per class (was 300) with diverse shape rendering (random turns, sizes, bump counts, etc.)
-Early stopping + ReduceLROnPlateau callbacks for optimal training
-2. 
-utils.py
- — Updated
-Removed all geometrical shape references from 
-heuristic_classify
- and 
-draw_perfect_shape
-Heuristic classifier now analyzes circularity, solidity, aspect ratio, and path openness to classify the 12 creative shapes
-Added padding to ROI preprocessing for better shape isolation
-3. 
-app.py
- — Updated
-Title changed to "AI Air Canvas — Creative Shape Detector"
-Added emoji mapping for all 12 shapes (🌀 Spiral, ♾️ Infinity, ☁️ Cloud, ⚡ Lightning bolt, etc.)
-Added "Supported Shapes" sidebar section showing all 12 shapes
-📊 Training Results
-Metric	Value
-Training Accuracy	~99.0%
-Validation Accuracy	99.44%
-Epochs trained	18 (early stopped at ~epoch 18)
-Total parameters	1.68M
-Model file	shape_model.h5 (19.5 MB)
-You can run the app with streamlit run app.py and it will detect all 12 creative shapes!
+Draw shapes in the air using your index finger and let AI detect them in real-time. Uses a CNN + Vision Transformer model trained on 12 creative shapes.
 
-Good
+## Supported Shapes
+
+🌀 Spiral · ♾️ Infinity · ☁️ Cloud · ⚡ Lightning bolt · 🌸 Flower · 🦋 Butterfly · 👑 Crown · 🔥 Flame · 🐟 Fish · 🍃 Leaf · 🎵 Music note · 😊 Smiley face
+
+## Quick Start
+
+**Prerequisites:** Python 3.10+, a webcam, and [Git LFS](https://git-lfs.github.com/) installed.
+
+```bash
+# 1. Clone (Git LFS pulls the model automatically)
+git lfs install
+git clone https://github.com/AVISHKAR-PROJECTS-HACKNCRAFTS/AI-Air-Drawing-Shape-Detection.git
+cd AI-Air-Drawing-Shape-Detection
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Run
+streamlit run app.py
+```
+
+> **If the model fails to load**, run `git lfs pull` inside the repo to download the model file.
+
+## How to Use
+
+1. Click **Start Camera** in the sidebar
+2. Hold up your **index finger** (keep other fingers closed) to draw
+3. When you pull your hand away, the AI classifies the shape
+4. Detected shapes appear on the canvas with confidence scores
+
+## Architecture
+
+- **Model:** 4-block CNN with Squeeze-and-Excitation attention + 3-layer Vision Transformer
+- **Parameters:** ~1.68M
+- **Input:** 128x128 grayscale images
+- **Training:** 3-phase curriculum (600 → 1500 → 2500 samples/class) with heavy augmentation
+
+## Re-training (Optional — Developers Only)
+
+If you want to retrain the model with a GPU:
+
+```bash
+python train_gpu.py
+```
+
+This generates synthetic training data and trains the CNN+ViT model from scratch. Requires a CUDA-capable GPU for reasonable training times.

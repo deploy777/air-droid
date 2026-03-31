@@ -3,6 +3,4 @@ opencv-python
 mediapipe
 numpy
 tensorflow
-tensorflow-hub
-matplotlib
 Pillow
