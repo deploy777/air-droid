@@ -57,32 +57,28 @@ def interpolate_gaps(points, max_gap=20):
 def test_time_augmentation(model, roi, shapes):
     """
     Run prediction on multiple augmented versions and average for robustness.
-    Augmentations: rotations, flips, slight scales, and gaussian noise.
+    Augmentations: rotations, slight scales, and gaussian noise.
+    Horizontal flip is excluded — it corrupts asymmetric shapes.
     """
     h, w = roi.shape[1], roi.shape[2]
     center = (w // 2, h // 2)
     all_preds = []
+
+    # Extract original image ONCE (avoid stale-variable bug)
+    img = roi[0, :, :, 0]
 
     # 1) Rotations: -15, -10, -5, 0, +5, +10, +15
     for angle in [-15, -10, -5, 0, 5, 10, 15]:
         if angle == 0:
             aug_roi = roi
         else:
-            img = roi[0, :, :, 0]
             M = cv2.getRotationMatrix2D(center, angle, 1.0)
             rotated = cv2.warpAffine(img, M, (w, h))
             aug_roi = np.expand_dims(np.expand_dims(rotated, axis=-1), axis=0)
         preds = model.predict(aug_roi, verbose=0)
         all_preds.append(preds[0])
 
-    # 2) Horizontal flip
-    img = roi[0, :, :, 0]
-    flipped = cv2.flip(img, 1)
-    aug_roi = np.expand_dims(np.expand_dims(flipped, axis=-1), axis=0)
-    preds = model.predict(aug_roi, verbose=0)
-    all_preds.append(preds[0])
-
-    # 3) Slight scale variations (0.9x and 1.1x)
+    # 2) Slight scale variations (0.9x and 1.1x)
     for scale in [0.9, 1.1]:
         M_scale = cv2.getRotationMatrix2D(center, 0, scale)
         scaled = cv2.warpAffine(img, M_scale, (w, h))
@@ -90,7 +86,7 @@ def test_time_augmentation(model, roi, shapes):
         preds = model.predict(aug_roi, verbose=0)
         all_preds.append(preds[0])
 
-    # 4) Gaussian noise variant
+    # 3) Gaussian noise variant
     noisy = np.clip(img + np.random.normal(0, 0.05, img.shape).astype(np.float32), 0, 1)
     aug_roi = np.expand_dims(np.expand_dims(noisy, axis=-1), axis=0)
     preds = model.predict(aug_roi, verbose=0)
@@ -305,6 +301,7 @@ if st.sidebar.button("🧹 Clear Canvas"):
 if st.sidebar.button("↩️ Undo Last Shape"):
     if st.session_state.detected_shapes:
         st.session_state.detected_shapes.pop()
+        st.session_state.top_predictions = []
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎯 Supported Shapes")
@@ -362,9 +359,9 @@ with col2:
 # ═══════════════════════════════════════════════════════════════
 
 CLASSIFY_DELAY = 0.5  # seconds to wait after hand disappears before classifying
-MIN_POINTS = 20       # minimum points required for classification (lowered for quick shapes)
-CONFIDENCE_ACCEPT = 0.40  # lowered: trust the improved model more
-CONFIDENCE_UNCERTAIN = 0.25
+MIN_POINTS = 20       # minimum points required for classification
+CONFIDENCE_ACCEPT = 0.55  # 12-class softmax: random=0.083, so 0.55 is strong signal
+CONFIDENCE_UNCERTAIN = 0.35
 
 if st.session_state.run_camera:
     cap = cv2.VideoCapture(0)
@@ -414,15 +411,15 @@ if st.session_state.run_camera:
                 elapsed = time.time() - st.session_state.hand_disappeared_time
 
                 if elapsed >= CLASSIFY_DELAY:
-                    # Preprocess points: deduplicate, interpolate gaps, smooth
-                    processed_pts = remove_duplicate_points(st.session_state.points)
+                    # Preprocess points: smooth first (reduce jitter), then deduplicate, then fill gaps
+                    processed_pts = smooth_points_ema(st.session_state.points, alpha=0.5)
+                    processed_pts = remove_duplicate_points(processed_pts)
                     processed_pts = interpolate_gaps(processed_pts)
-                    processed_pts = smooth_points_ema(processed_pts, alpha=0.5)
 
-                    roi = preprocess_gesture(processed_pts)
+                    roi = preprocess_gesture(processed_pts, frame_hw=(h, w))
                     if roi is not None:
                         if demo_mode:
-                            shape_name, confidence = heuristic_classify(processed_pts)
+                            shape_name, confidence = heuristic_classify(processed_pts, frame_hw=(h, w))
                             top3 = [(shape_name, confidence)]
                         else:
                             if use_tta:
@@ -468,6 +465,8 @@ if st.session_state.run_camera:
                         else:
                             prediction_label.error("❓ Unknown shape — try drawing more clearly")
                             confidence_bar.progress(confidence)
+                    else:
+                        prediction_label.error("❓ Drawing too small — try drawing larger")
 
                     st.session_state.points = []
                     st.session_state.last_point = None

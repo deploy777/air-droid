@@ -40,65 +40,72 @@ class HandTracker:
                     return cx, cy, hand_landmarks
         return None, None, None
 
-def preprocess_gesture(points, canvas_size=(128, 128)):
+def preprocess_canvas(mask, output_size=128):
     """
-    Preprocesses the drawn points into a format suitable for the CNN+ViT model.
-    Fixed: preserves aspect ratio, keeps ALL drawn features (internal details),
-    uses consistent stroke thickness matching training data.
+    Shared preprocessing: crop drawing to content, pad to square, resize.
+    Used by BOTH training data generation AND inference to guarantee alignment.
+
+    Args:
+        mask: Binary image (uint8, white-on-black) of any size.
+        output_size: Target square dimension.
+    Returns:
+        Processed uint8 image (output_size x output_size), or None if empty/too small.
     """
-    if not points or len(points) < 2:
-        return None
-
-    # Create a blank black image matching webcam resolution
-    mask = np.zeros((480, 640), dtype=np.uint8)
-
-    # Draw with consistent thickness (matches training data median of 2-6)
-    thickness = 4
-    for i in range(1, len(points)):
-        if points[i-1] is not None and points[i] is not None:
-            cv2.line(mask, points[i-1], points[i], 255, thickness)
-
-    # Use findNonZero to get bounding box of ALL drawn pixels
-    # (unlike findContours which only gets the largest contour and loses
-    # internal features like smiley face eyes, music note stems, etc.)
     nonzero = cv2.findNonZero(mask)
     if nonzero is None:
         return None
 
     x, y, w, h = cv2.boundingRect(nonzero)
 
-    # Skip if too small
     if w < 10 or h < 10:
         return None
 
-    # Add generous proportional padding
+    # Proportional padding — track actual shift to avoid asymmetric overpad at edges
     pad = max(15, max(w, h) // 6)
+    orig_x, orig_y = x, y
     x = max(0, x - pad)
     y = max(0, y - pad)
-    w = min(mask.shape[1] - x, w + 2 * pad)
-    h = min(mask.shape[0] - y, h + 2 * pad)
+    w = min(mask.shape[1] - x, w + (orig_x - x) + pad)
+    h = min(mask.shape[0] - y, h + (orig_y - y) + pad)
 
-    # Crop
     roi = mask[y:y+h, x:x+w]
 
-    # CRITICAL: Preserve aspect ratio by padding to square before resize
+    # Pad to square preserving aspect ratio
     max_dim = max(roi.shape[0], roi.shape[1])
     square = np.zeros((max_dim, max_dim), dtype=np.uint8)
     y_off = (max_dim - roi.shape[0]) // 2
     x_off = (max_dim - roi.shape[1]) // 2
     square[y_off:y_off+roi.shape[0], x_off:x_off+roi.shape[1]] = roi
 
-    # Resize to model input size with high-quality interpolation
-    roi = cv2.resize(square, canvas_size, interpolation=cv2.INTER_AREA)
+    result = cv2.resize(square, (output_size, output_size), interpolation=cv2.INTER_AREA)
+    return result
 
-    # Normalize
-    roi = roi.astype('float32') / 255.0
-    roi = np.expand_dims(roi, axis=-1)  # Add channel dimension
-    roi = np.expand_dims(roi, axis=0)   # Add batch dimension
 
-    return roi
+def preprocess_gesture(points, frame_hw=(480, 640), canvas_size=(128, 128)):
+    """
+    Preprocesses drawn points into model input using the shared preprocess_canvas.
+    Accepts actual frame dimensions to handle any webcam resolution.
+    """
+    if not points or len(points) < 2:
+        return None
 
-def heuristic_classify(points):
+    mask = np.zeros(frame_hw, dtype=np.uint8)
+
+    thickness = 4
+    for i in range(1, len(points)):
+        if points[i-1] is not None and points[i] is not None:
+            cv2.line(mask, points[i-1], points[i], 255, thickness)
+
+    result = preprocess_canvas(mask, output_size=canvas_size[0])
+    if result is None:
+        return None
+
+    result = result.astype('float32') / 255.0
+    result = np.expand_dims(result, axis=-1)
+    result = np.expand_dims(result, axis=0)
+    return result
+
+def heuristic_classify(points, frame_hw=(480, 640)):
     """
     Heuristic classification fallback for the 12 creative shapes.
     Uses geometric properties, path analysis, and contour features.
@@ -106,7 +113,7 @@ def heuristic_classify(points):
     if not points or len(points) < 10:
         return "Spiral", 0.4
 
-    mask = np.zeros((480, 640), dtype=np.uint8)
+    mask = np.zeros(frame_hw, dtype=np.uint8)
     for i in range(1, len(points)):
         if points[i-1] is not None and points[i] is not None:
             cv2.line(mask, points[i-1], points[i], 255, 4)

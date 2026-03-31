@@ -6,6 +6,7 @@ import os
 import math
 import random
 from collections import Counter
+from utils import preprocess_canvas
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -314,7 +315,11 @@ SHAPES = [
     "Music note", "Smiley face"
 ]
 
-MODEL_PATH = 'shape_model.h5'
+MODEL_PATH = 'shape_model_v2.h5'
+
+# Training canvas size — matches webcam-like resolution so that stroke
+# proportions and preprocessing behaviour are identical to inference.
+DRAW_CANVAS = 480
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -357,8 +362,10 @@ def _draw_varying_thickness(img, points, base_thickness=3, mode='taper'):
             thick = max(1, int(base_thickness * (0.4 + 0.6 * t)))
         else:  # pulse
             thick = max(1, int(base_thickness * (0.7 + 0.3 * np.sin(t * np.pi * 3))))
-        pt1 = tuple(np.clip(points[i], 0, img.shape[0] - 1))
-        pt2 = tuple(np.clip(points[i + 1], 0, img.shape[0] - 1))
+        pt1 = (int(np.clip(points[i][0], 0, img.shape[1] - 1)),
+               int(np.clip(points[i][1], 0, img.shape[0] - 1)))
+        pt2 = (int(np.clip(points[i + 1][0], 0, img.shape[1] - 1)),
+               int(np.clip(points[i + 1][1], 0, img.shape[0] - 1)))
         cv2.line(img, pt1, pt2, 255, thick)
     return img
 
@@ -472,19 +479,19 @@ def augment_image(img):
 
 
 def draw_shape_on_canvas(shape_name, size=128):
-    """Draw a single shape with multiple style variants and hand-drawn effects."""
-    img = np.zeros((size, size), dtype=np.uint8)
+    """Draw a shape on a large canvas, then preprocess identically to inference."""
+    img = np.zeros((DRAW_CANVAS, DRAW_CANVAS), dtype=np.uint8)
 
-    # Broader positioning across canvas
-    center = (np.random.randint(32, 96), np.random.randint(32, 96))
-    w = np.random.randint(20, 50)
-    h = np.random.randint(20, 50)
+    # Parameters scaled for 480x480 canvas (simulates webcam-like drawing)
+    center = (np.random.randint(140, 340), np.random.randint(140, 340))
+    w = np.random.randint(40, 130)
+    h = np.random.randint(40, 130)
     color = 255
-    thickness = np.random.randint(2, 6)
+    thickness = np.random.randint(2, 7)
     use_varying_thickness = np.random.random() < 0.3
     thickness_mode = np.random.choice(['taper', 'reverse_taper', 'pulse'])
-    wobble_intensity = np.random.uniform(0.5, 2.5)
-    is_partial = np.random.random() < 0.1  # 10% partial shapes
+    wobble_intensity = np.random.uniform(1.0, 5.0)
+    is_partial = np.random.random() < 0.1
 
     if shape_name == "Spiral":
         variant = np.random.choice(["outward", "inward", "tight"])
@@ -528,21 +535,30 @@ def draw_shape_on_canvas(shape_name, size=128):
                 cv2.polylines(img, [np.array(pts)], True, color, thickness)
 
     elif shape_name == "Cloud":
-        variant = np.random.choice(["round", "flat", "puffy"])
-        num_bumps = np.random.randint(4, 8)
+        # Cloud: flat/gently-curved bottom + bumpy semicircular top (NOT radial sinusoid)
+        num_bumps = np.random.randint(3, 6)
+        cloud_w = w * np.random.uniform(0.8, 1.2)
+        cloud_h = h * np.random.uniform(0.5, 0.8)
+        bump_r = cloud_h * np.random.uniform(0.3, 0.5)
         pts = []
-        base_r = w * np.random.uniform(0.5, 0.7)
-        bump_amp = w * np.random.uniform(0.15, 0.35)
-        if variant == "puffy":
-            bump_amp *= 1.4
-        aspect = 0.65 if variant == "flat" else np.random.uniform(0.8, 1.0)
-        phase = np.random.uniform(0, 2 * np.pi)
-        for t in np.arange(0, 2 * np.pi + 0.1, 0.05):
-            bump = bump_amp * abs(np.sin(num_bumps * t / 2 + phase))
-            r = base_r + bump
-            px = int(center[0] + r * np.cos(t))
-            py = int(center[1] + r * aspect * np.sin(t))
-            pts.append([px, py])
+        # Bottom: gentle flat line from left to right
+        bottom_y = center[1] + int(cloud_h * 0.3)
+        sag = np.random.uniform(0, cloud_h * 0.15)
+        for i in range(20):
+            t = i / 19.0
+            bx = int(center[0] - cloud_w + 2 * cloud_w * t)
+            by = int(bottom_y + sag * np.sin(t * np.pi))
+            pts.append([bx, by])
+        # Top: semicircular bumps from right to left
+        bump_centers = np.linspace(center[0] + cloud_w * 0.8, center[0] - cloud_w * 0.8, num_bumps)
+        top_y = center[1] - int(cloud_h * 0.3)
+        for bc in bump_centers:
+            br = bump_r * np.random.uniform(0.7, 1.3)
+            for a in np.arange(0, np.pi + 0.1, 0.15):
+                bx = int(bc + br * np.cos(a + np.pi))
+                by = int(top_y - br * np.sin(a))
+                pts.append([bx, by])
+        pts.append(pts[0])  # close the shape
         if is_partial:
             pts = pts[:int(len(pts) * np.random.uniform(0.6, 0.85))]
         pts = _add_wobble(pts, wobble_intensity)
@@ -550,7 +566,7 @@ def draw_shape_on_canvas(shape_name, size=128):
             if use_varying_thickness:
                 _draw_varying_thickness(img, pts, thickness, thickness_mode)
             else:
-                cv2.polylines(img, [np.array(pts)], True, color, thickness)
+                cv2.polylines(img, [np.array(pts)], False, color, thickness)
 
     elif shape_name == "Lightning bolt":
         variant = np.random.choice(["zigzag", "curved", "forked"])
@@ -598,16 +614,34 @@ def draw_shape_on_canvas(shape_name, size=128):
                 cv2.polylines(img, [np.array(pts)], True, color, thickness)
 
     elif shape_name == "Butterfly":
-        variant = np.random.choice(["standard", "wide", "compact"])
-        wing_scale = 1.3 if variant == "wide" else (0.8 if variant == "compact" else 1.0)
+        # Butterfly: two mirrored wing outlines that meet at center body line
+        wing_w = w * np.random.uniform(0.7, 1.2)
+        upper_h = h * np.random.uniform(0.6, 0.9)
+        lower_h = h * np.random.uniform(0.3, 0.5)
         pts = []
-        # 4-petal rose curve: distinctly butterfly-shaped with crossing at center
-        for t in np.arange(0, 2 * np.pi, 0.04):
-            r = w * wing_scale * abs(np.sin(2 * t))
-            r = max(r, 1)
-            px = int(center[0] + r * np.cos(t))
-            py = int(center[1] + r * 0.7 * np.sin(t))
-            pts.append([px, py])
+        # Body line (vertical center)
+        body_top = center[1] - int(upper_h * 0.8)
+        body_bot = center[1] + int(lower_h * 0.8)
+        # Left upper wing (elliptical arc going left then back to center)
+        for t in np.arange(0, np.pi + 0.1, 0.08):
+            wx = int(center[0] - wing_w * np.sin(t))
+            wy = int(center[1] - upper_h * 0.6 * np.sin(t) - upper_h * 0.2 * (1 - np.cos(t)))
+            pts.append([wx, wy])
+        # Left lower wing (smaller, going left-down then back)
+        for t in np.arange(0, np.pi + 0.1, 0.1):
+            wx = int(center[0] - wing_w * 0.7 * np.sin(t))
+            wy = int(center[1] + lower_h * 0.7 * np.sin(t) + lower_h * 0.1 * (1 - np.cos(t)))
+            pts.append([wx, wy])
+        # Right lower wing (mirrored)
+        for t in np.arange(0, np.pi + 0.1, 0.1):
+            wx = int(center[0] + wing_w * 0.7 * np.sin(t))
+            wy = int(center[1] + lower_h * 0.7 * np.sin(t) + lower_h * 0.1 * (1 - np.cos(t)))
+            pts.append([wx, wy])
+        # Right upper wing (mirrored)
+        for t in np.arange(0, np.pi + 0.1, 0.08):
+            wx = int(center[0] + wing_w * np.sin(t))
+            wy = int(center[1] - upper_h * 0.6 * np.sin(t) - upper_h * 0.2 * (1 - np.cos(t)))
+            pts.append([wx, wy])
         if is_partial:
             pts = pts[:int(len(pts) * np.random.uniform(0.6, 0.85))]
         pts = _add_wobble(pts, wobble_intensity)
@@ -615,10 +649,10 @@ def draw_shape_on_canvas(shape_name, size=128):
             if use_varying_thickness:
                 _draw_varying_thickness(img, pts, thickness, thickness_mode)
             else:
-                cv2.polylines(img, [np.array(pts)], True, color, thickness)
-        # Draw thin body line through center
-        body_pts = _add_wobble([[center[0], center[1] - h // 2],
-                                [center[0], center[1] + h // 2]], wobble_intensity * 0.5)
+                cv2.polylines(img, [np.array(pts)], False, color, thickness)
+        # Body line through center
+        body_pts = _add_wobble([[center[0], body_top],
+                                [center[0], body_bot]], wobble_intensity * 0.5)
         cv2.polylines(img, [np.array(body_pts)], False, color, max(1, thickness - 1))
 
     elif shape_name == "Crown":
@@ -638,16 +672,18 @@ def draw_shape_on_canvas(shape_name, size=128):
         cv2.polylines(img, [np.array(pts)], True, color, thickness)
 
     elif shape_name == "Flame":
-        variant = np.random.choice(["standard", "narrow", "flickering"])
+        # Flame: teardrop shape — wide base, pointed top (like a candle flame)
+        flame_w = w * np.random.uniform(0.6, 1.0)
+        flame_h = h * np.random.uniform(1.0, 1.5)
+        taper = np.random.uniform(1.5, 3.0)  # how pointy the top is
         pts = []
-        flicker = np.random.uniform(0.2, 0.5) if variant == "flickering" else 0
-        w_mod = 0.7 if variant == "narrow" else 1.0
-        for t in np.arange(0, 2 * np.pi, 0.06):
-            fx = w * w_mod * np.cos(t) + flicker * np.random.uniform(-5, 5)
-            mod = np.sin(t / 2) ** np.random.uniform(0.3, 0.7) if t < np.pi else 1.0
-            fy = h * np.sin(t) * mod
-            px = int(center[0] + fx)
-            py = int(center[1] + fy)
+        for t in np.arange(0, 2 * np.pi + 0.05, 0.06):
+            # Teardrop parametric: wider at bottom (t=pi), pointed at top (t=0)
+            # Use sin(t/2)^taper to create the taper effect
+            r_x = flame_w * np.sin(t)
+            r_y = flame_h * (max(0.0, np.sin(t / 2)) ** taper - 0.5)
+            px = int(center[0] + r_x)
+            py = int(center[1] - r_y)
             pts.append([px, py])
         pts = _add_wobble(pts, wobble_intensity)
         if len(pts) > 1:
@@ -813,7 +849,9 @@ def draw_shape_on_canvas(shape_name, size=128):
             else:
                 cv2.polylines(img, [np.array(pts)], False, color, thickness)
 
-    return img
+    # CRITICAL: apply the same crop→pad→resize as inference pipeline
+    processed = preprocess_canvas(img, output_size=size)
+    return processed if processed is not None else np.zeros((size, size), dtype=np.uint8)
 
 
 def generate_synthetic_data(samples_per_class=2500):
@@ -845,11 +883,11 @@ def generate_synthetic_data(samples_per_class=2500):
             X.append(np.expand_dims(img, axis=-1))
             y.append(idx)
 
-        # Mixup: blend pairs of same-class samples (15% extra)
-        num_mixup = max(1, samples_per_class // 7)
+        # Mixup: one image dominates, second adds faint variation (not 50/50 ghost)
+        num_mixup = max(1, samples_per_class // 10)
         for _ in range(num_mixup):
             i1, i2 = np.random.choice(len(class_images), 2, replace=False)
-            lam = np.random.uniform(0.3, 0.7)
+            lam = np.random.uniform(0.85, 0.95)
             mixed = lam * class_images[i1] + (1 - lam) * class_images[i2]
             X.append(np.expand_dims(mixed, axis=-1))
             y.append(idx)
@@ -869,15 +907,23 @@ def generate_synthetic_data(samples_per_class=2500):
 
 def train_model():
     """
-    Three-phase training strategy for maximum accuracy:
+    Three-phase training strategy for maximum accuracy.
+    GPU memory growth enabled for small-VRAM GPUs (4GB RTX 2050).
     Phase 1: Initial training with moderate data for convergence
     Phase 2: Fine-tune with more data and lower LR
     Phase 3: Final polish with heavy augmentation and very low LR
     """
+    # Enable GPU memory growth to avoid OOM on small-VRAM GPUs
+    gpus = tf.config.list_physical_devices('GPU')
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
     print("=" * 60)
     print("  TRAINING ENHANCED CNN + VISION TRANSFORMER MODEL")
-    print("  Classes:", SHAPES)
+    print(f"  GPUs: {len(gpus)} | Classes: {SHAPES}")
     print("=" * 60)
+
+    BATCH_SIZE = 16 if gpus and len(gpus) > 0 else 32
 
     # ---- Phase 1: Initial Training ----
     print("\n" + "=" * 60)
@@ -901,9 +947,6 @@ def train_model():
             monitor='val_accuracy', patience=20,
             restore_best_weights=True, min_delta=0.001
         ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss', factor=0.3, patience=8, min_lr=1e-7, verbose=1
-        ),
         tf.keras.callbacks.ModelCheckpoint(
             MODEL_PATH, monitor='val_accuracy',
             save_best_only=True, verbose=1
@@ -913,7 +956,7 @@ def train_model():
     history1 = model.fit(
         X1, y1,
         epochs=40,
-        batch_size=64,
+        batch_size=BATCH_SIZE,
         validation_split=0.15,
         callbacks=callbacks_p1,
         verbose=1
@@ -955,9 +998,6 @@ def train_model():
             monitor='val_accuracy', patience=20,
             restore_best_weights=True, min_delta=0.0005
         ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss', factor=0.3, patience=8, min_lr=1e-8, verbose=1
-        ),
         tf.keras.callbacks.ModelCheckpoint(
             MODEL_PATH, monitor='val_accuracy',
             save_best_only=True, verbose=1
@@ -967,7 +1007,7 @@ def train_model():
     history2 = model.fit(
         X2, y2,
         epochs=30,
-        batch_size=64,
+        batch_size=BATCH_SIZE,
         validation_split=0.15,
         callbacks=callbacks_p2,
         verbose=1
@@ -1009,9 +1049,6 @@ def train_model():
             monitor='val_accuracy', patience=15,
             restore_best_weights=True, min_delta=0.0003
         ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss', factor=0.5, patience=6, min_lr=1e-9, verbose=1
-        ),
         tf.keras.callbacks.ModelCheckpoint(
             MODEL_PATH, monitor='val_accuracy',
             save_best_only=True, verbose=1
@@ -1021,7 +1058,7 @@ def train_model():
     history3 = model.fit(
         X3, y3,
         epochs=25,
-        batch_size=64,
+        batch_size=BATCH_SIZE,
         validation_split=0.15,
         callbacks=callbacks_p3,
         verbose=1
