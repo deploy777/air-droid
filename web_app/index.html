@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Air Canvas - Creative Shape Detector</title>
+    <meta name="description" content="Draw shapes in the air using hand gestures. AI-powered CNN + Transformer model detects 12 creative shapes in real-time.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Splash -->
+    <div id="splash" class="splash">
+        <div class="splash-content">
+            <div class="splash-icon">🎨</div>
+            <h1>AI Air Canvas</h1>
+            <p>Creative Shape Detector</p>
+            <div class="splash-loader"><div class="loader-bar" id="loaderBar"></div></div>
+            <span class="splash-text" id="splashText">Loading AI Model...</span>
+        </div>
+    </div>
+
+    <!-- Main App -->
+    <div id="app" class="app hidden">
+        <header class="header">
+            <div class="header-left">
+                <span class="logo-icon">🎨</span>
+                <div>
+                    <h1>AI Air Canvas</h1>
+                    <p class="subtitle">Draw &amp; detect 12 creative shapes with CNN + Transformer AI</p>
+                </div>
+            </div>
+            <div class="header-right">
+                <div class="status-badge" id="cameraStatus">
+                    <span class="status-dot offline"></span>
+                    <span>Camera Off</span>
+                </div>
+            </div>
+        </header>
+
+        <main class="main-content">
+            <section class="canvas-section">
+                <div class="video-container" id="videoContainer">
+                    <video id="webcam" autoplay playsinline muted></video>
+                    <canvas id="drawCanvas"></canvas>
+                    <canvas id="handCanvas"></canvas>
+
+                    <div class="video-overlay-top">
+                        <span class="recording-dot" id="recordingDot"></span>
+                        <span id="drawingStatus" class="drawing-status">Ready to draw</span>
+                    </div>
+
+                    <div class="start-overlay" id="startOverlay">
+                        <div class="start-content">
+                            <div class="camera-icon">📷</div>
+                            <h2>Start Your Camera</h2>
+                            <p>Show your index finger only to draw shapes in the air</p>
+                            <button class="btn btn-primary btn-lg" id="startBtn">
+                                <span>▶</span> Start Camera
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="controls-bar">
+                    <button class="btn btn-icon" id="toggleCameraBtn" title="Toggle Camera"><span id="cameraIcon">📷</span></button>
+                    <button class="btn btn-icon" id="clearBtn" title="Clear All">🧹</button>
+                    <button class="btn btn-icon" id="undoBtn" title="Undo">↩️</button>
+                    <div class="divider"></div>
+                    <label class="color-label" title="Color">🎨<input type="color" id="colorPicker" value="#00FF88"></label>
+                    <div class="divider"></div>
+                    <div class="point-counter"><span id="pointCount">0</span> pts</div>
+                </div>
+            </section>
+
+            <aside class="results-panel">
+                <div class="card result-card" id="resultCard">
+                    <div class="card-header"><h3>🔮 Detection Result</h3></div>
+                    <div class="card-body" id="resultBody">
+                        <div class="empty-state"><span class="empty-icon">✋</span><p>Draw a shape to see AI predictions</p></div>
+                    </div>
+                </div>
+                <div class="card" id="predictionsCard" style="display:none">
+                    <div class="card-header"><h3>📊 Top Predictions</h3></div>
+                    <div class="card-body" id="predictionsBody"></div>
+                </div>
+                <div class="card">
+                    <div class="card-header"><h3>📜 History</h3><span class="badge" id="historyCount">0</span></div>
+                    <div class="card-body history-list" id="historyList">
+                        <div class="empty-state small"><p>No shapes detected yet</p></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-header"><h3>🎯 Supported Shapes</h3></div>
+                    <div class="card-body shapes-grid">
+                        <div class="shape-tag">🌀 Spiral</div>
+                        <div class="shape-tag">♾️ Infinity</div>
+                        <div class="shape-tag">☁️ Cloud</div>
+                        <div class="shape-tag">⚡ Lightning</div>
+                        <div class="shape-tag">🌸 Flower</div>
+                        <div class="shape-tag">🦋 Butterfly</div>
+                        <div class="shape-tag">👑 Crown</div>
+                        <div class="shape-tag">🔥 Flame</div>
+                        <div class="shape-tag">🐟 Fish</div>
+                        <div class="shape-tag">🍃 Leaf</div>
+                        <div class="shape-tag">🎵 Music note</div>
+                        <div class="shape-tag">😊 Smiley</div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-header"><h3>💡 How to Use</h3></div>
+                    <div class="card-body instructions">
+                        <div class="step"><span class="step-num">1</span> Click "Start Camera"</div>
+                        <div class="step"><span class="step-num">2</span> Raise <strong>only your index finger</strong></div>
+                        <div class="step"><span class="step-num">3</span> Draw a shape in the air</div>
+                        <div class="step"><span class="step-num">4</span> Pull hand away — AI detects!</div>
+                    </div>
+                </div>
+            </aside>
+        </main>
+    </div>
+
+    <!-- MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.min.js"></script>
+    <!-- TFLite runtime for browser -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/dist/tf-tflite.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
