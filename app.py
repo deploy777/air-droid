@@ -1,54 +1,16 @@
-"""
-AI Air Drawing — Flask version
-Same model, same inference pipeline as app.py — just HTML instead of Streamlit.
-Uses server-side OpenCV + MediaPipe (identical to original app.py).
-Video is streamed to browser via MJPEG.
-"""
-
+import streamlit as st
 import cv2
 import numpy as np
-import time
-import json
-import threading
-from flask import Flask, render_template, Response, jsonify, request
-from flask_cors import CORS
 from utils import HandTracker, preprocess_gesture, draw_perfect_shape, heuristic_classify
 from model import load_model, SHAPES
-
-app = Flask(__name__, static_folder="static", template_folder="templates")
-CORS(app)
-
-# ── Load AI model (same as app.py) ──
-print("Loading AI model...")
-model = load_model()
-print(f"Model loaded! Input: {model.input_shape} -> Output: {model.output_shape}")
-
-tracker = HandTracker()
-
-# ── Shared state (thread-safe) ──
-state_lock = threading.Lock()
-state = {
-    "run_camera": False,
-    "points": [],
-    "detected_shapes": [],
-    "current_color": (0, 255, 136),
-    "hand_disappeared_time": None,
-    "top_predictions": [],
-    "last_point": None,
-    "last_result": None,
-}
-
-SHAPE_EMOJIS = {
-    "Spiral": "🌀", "Infinity": "♾️", "Cloud": "☁️", "Lightning bolt": "⚡",
-    "Flower": "🌸", "Butterfly": "🦋", "Crown": "👑", "Flame": "🔥",
-    "Fish": "🐟", "Leaf": "🍃", "Music note": "🎵", "Smiley face": "😊"
-}
+import time
 
 # ═══════════════════════════════════════════════════════════════
-# Helper Functions — IDENTICAL to app.py
+# Helper Functions for Improved Inference Pipeline
 # ═══════════════════════════════════════════════════════════════
 
 def smooth_points_ema(points, alpha=0.4):
+    """Apply exponential moving average smoothing to reduce hand jitter."""
     if len(points) < 2:
         return points
     smoothed = [points[0]]
@@ -60,6 +22,7 @@ def smooth_points_ema(points, alpha=0.4):
 
 
 def remove_duplicate_points(points, min_dist=3):
+    """Remove points that are within min_dist pixels of each other."""
     if len(points) < 2:
         return points
     filtered = [points[0]]
@@ -72,6 +35,7 @@ def remove_duplicate_points(points, min_dist=3):
 
 
 def interpolate_gaps(points, max_gap=20):
+    """Interpolate between points that are far apart to fill gaps."""
     if len(points) < 2:
         return points
     interpolated = [points[0]]
@@ -91,11 +55,19 @@ def interpolate_gaps(points, max_gap=20):
 
 
 def test_time_augmentation(model, roi, shapes):
+    """
+    Run prediction on multiple augmented versions and average for robustness.
+    Augmentations: rotations, slight scales, and gaussian noise.
+    Horizontal flip is excluded — it corrupts asymmetric shapes.
+    """
     h, w = roi.shape[1], roi.shape[2]
     center = (w // 2, h // 2)
     all_preds = []
+
+    # Extract original image ONCE (avoid stale-variable bug)
     img = roi[0, :, :, 0]
 
+    # 1) Rotations: -15, -10, -5, 0, +5, +10, +15
     for angle in [-15, -10, -5, 0, 5, 10, 15]:
         if angle == 0:
             aug_roi = roi
@@ -106,6 +78,7 @@ def test_time_augmentation(model, roi, shapes):
         preds = model.predict(aug_roi, verbose=0)
         all_preds.append(preds[0])
 
+    # 2) Slight scale variations (0.9x and 1.1x)
     for scale in [0.9, 1.1]:
         M_scale = cv2.getRotationMatrix2D(center, 0, scale)
         scaled = cv2.warpAffine(img, M_scale, (w, h))
@@ -113,6 +86,7 @@ def test_time_augmentation(model, roi, shapes):
         preds = model.predict(aug_roi, verbose=0)
         all_preds.append(preds[0])
 
+    # 3) Gaussian noise variant
     noisy = np.clip(img + np.random.normal(0, 0.05, img.shape).astype(np.float32), 0, 1)
     aug_roi = np.expand_dims(np.expand_dims(noisy, axis=-1), axis=0)
     preds = model.predict(aug_roi, verbose=0)
@@ -123,6 +97,7 @@ def test_time_augmentation(model, roi, shapes):
     confidence = float(avg_preds[class_idx])
     shape_name = shapes[class_idx]
 
+    # Get top-3 predictions
     top3_idx = np.argsort(avg_preds)[::-1][:3]
     top3 = [(shapes[i], float(avg_preds[i])) for i in top3_idx]
 
@@ -130,17 +105,24 @@ def test_time_augmentation(model, roi, shapes):
 
 
 def geometric_disambiguate(points, cnn_shape, cnn_confidence, top3):
+    """
+    Use geometric features to disambiguate when CNN confidence is moderate.
+    Resolves common confusions between visually similar shapes.
+    """
     if cnn_confidence > 0.75 or len(points) < 15:
         return cnn_shape, cnn_confidence, top3
 
     pts = np.array(points, dtype=np.float32)
+    # Compute geometric features
     x, y, bw, bh = cv2.boundingRect(pts.astype(np.int32))
     aspect = float(bw) / max(bh, 1)
 
+    # Path properties
     start_end_dist = np.linalg.norm(pts[0] - pts[-1])
     max_extent = max(bw, bh)
     is_closed = start_end_dist < max_extent * 0.25
 
+    # Check for self-crossings (characteristic of infinity, butterfly)
     crossings = 0
     segments = len(pts) - 1
     if segments > 10:
@@ -156,12 +138,16 @@ def geometric_disambiguate(points, cnn_shape, cnn_confidence, top3):
                 if d1 * d2 < 0 and d3 * d4 < 0:
                     crossings += 1
 
+    # Radius progression (spiral check: monotonically increasing/decreasing)
     centroid = np.mean(pts, axis=0)
     radii = np.sqrt(np.sum((pts - centroid) ** 2, axis=1))
     radius_trend = np.corrcoef(np.arange(len(radii)), radii)[0, 1] if len(radii) > 2 else 0
 
+    # Top-2 CNN candidates
     top2_names = [n for n, c in top3[:2]]
 
+    # Disambiguation rules for common confusions
+    # Spiral vs Infinity: spiral has monotonic radius, infinity crosses itself
     if set(top2_names) & {"Spiral", "Infinity"}:
         if crossings > 2 and abs(radius_trend) < 0.5:
             if cnn_shape != "Infinity":
@@ -170,11 +156,18 @@ def geometric_disambiguate(points, cnn_shape, cnn_confidence, top3):
             if cnn_shape != "Spiral":
                 return "Spiral", max(cnn_confidence, 0.6), top3
 
+    # Cloud vs Smiley: smiley is more circular, cloud is bumpy
+    if set(top2_names) & {"Cloud", "Smiley face"}:
+        if 0.8 < aspect < 1.25 and is_closed:
+            # More likely smiley (round, closed)
+            pass  # Trust CNN here
+
+    # Lightning vs Crown: lightning is vertical, crown is horizontal
     if set(top2_names) & {"Lightning bolt", "Crown"}:
-        if aspect < 0.6:
+        if aspect < 0.6:  # Tall and narrow
             if cnn_shape != "Lightning bolt":
                 return "Lightning bolt", max(cnn_confidence, 0.6), top3
-        elif aspect > 1.5:
+        elif aspect > 1.5:  # Wide
             if cnn_shape != "Crown":
                 return "Crown", max(cnn_confidence, 0.6), top3
 
@@ -182,6 +175,7 @@ def geometric_disambiguate(points, cnn_shape, cnn_confidence, top3):
 
 
 def stabilize_drawing_point(points, window=3):
+    """Average the last `window` points for smoother on-screen drawing."""
     if len(points) < window:
         window = len(points)
     recent = points[-window:]
@@ -191,251 +185,308 @@ def stabilize_drawing_point(points, window=3):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Camera Loop — same logic as app.py, runs in background thread
+# Page Config & Styling
 # ═══════════════════════════════════════════════════════════════
 
-CLASSIFY_DELAY = 0.5
-MIN_POINTS = 20
-CONFIDENCE_ACCEPT = 0.55
+st.set_page_config(page_title="AI Air Drawing Shape Detector", layout="wide")
+
+st.markdown("""
+    <style>
+    .main {
+        background: linear-gradient(135deg, #1e1e2f 0%, #2d2d44 100%);
+        color: #ffffff;
+    }
+    .stApp {
+        background: linear-gradient(135deg, #1e1e2f 0%, #2d2d44 100%);
+    }
+    .stSidebar {
+        background-color: rgba(45, 45, 68, 0.8);
+        border-right: 1px solid #444;
+    }
+    h1 {
+        color: #00f2fe;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        font-family: 'Inter', sans-serif;
+    }
+    .stButton>button {
+        background: linear-gradient(45deg, #00dbde 0%, #fc00ff 100%);
+        color: white;
+        border: none;
+        border-radius: 20px;
+        padding: 10px 24px;
+        font-weight: bold;
+        transition: all 0.3s ease;
+    }
+    .stButton>button:hover {
+        transform: scale(1.05);
+        box-shadow: 0 5px 15px rgba(252, 0, 255, 0.4);
+    }
+    .shape-card {
+        background: rgba(255, 255, 255, 0.1);
+        padding: 10px;
+        border-radius: 10px;
+        margin-bottom: 5px;
+        border-left: 5px solid #00f2fe;
+    }
+    .prediction-card {
+        background: rgba(0, 242, 254, 0.1);
+        padding: 8px 12px;
+        border-radius: 8px;
+        margin-bottom: 4px;
+        border-left: 4px solid #fc00ff;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+st.title("🎨 AI Air Canvas — Creative Shape Detector")
+st.subheader("Draw & detect 12 creative shapes in real-time using CNN + Transformer AI")
+
+# Show supported shapes
+shape_emojis = {
+    "Spiral": "🌀", "Infinity": "♾️", "Cloud": "☁️", "Lightning bolt": "⚡",
+    "Flower": "🌸", "Butterfly": "🦋", "Crown": "👑", "Flame": "🔥",
+    "Fish": "🐟", "Leaf": "🍃", "Music note": "🎵", "Smiley face": "😊"
+}
+
+# Initialize Session State
+if 'run_camera' not in st.session_state:
+    st.session_state.run_camera = False
+if 'drawing' not in st.session_state:
+    st.session_state.drawing = False
+if 'points' not in st.session_state:
+    st.session_state.points = []
+if 'detected_shapes' not in st.session_state:
+    st.session_state.detected_shapes = []
+if 'current_color' not in st.session_state:
+    st.session_state.current_color = (0, 255, 0)  # Green
+if 'hand_disappeared_time' not in st.session_state:
+    st.session_state.hand_disappeared_time = None
+if 'top_predictions' not in st.session_state:
+    st.session_state.top_predictions = []
+if 'last_point' not in st.session_state:
+    st.session_state.last_point = None
+
+# Sidebar
+st.sidebar.header("🎮 Controls")
+
+col_start, col_stop = st.sidebar.columns(2)
+if col_start.button("▶️ Start Camera"):
+    st.session_state.run_camera = True
+if col_stop.button("⏹️ Stop Camera"):
+    st.session_state.run_camera = False
+
+color_picker = st.sidebar.color_picker("Pick a Shape Fill Color", "#00FF00")
+st.sidebar.markdown("---")
+demo_mode = st.sidebar.checkbox("Use Heuristic Fallback", value=False, help="Uses geometric heuristics instead of the AI model. AI model is more advanced (CNN+Transformer).")
+use_tta = st.sidebar.checkbox("Use Test-Time Augmentation", value=True, help="Averages multiple predictions for more robust classification. Slightly slower but more accurate.")
+
+st.sidebar.markdown("---")
+# Convert hex to RGB
+hex_color = color_picker.lstrip('#')
+st.session_state.current_color = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+if st.sidebar.button("🧹 Clear Canvas"):
+    st.session_state.points = []
+    st.session_state.detected_shapes = []
+    st.session_state.top_predictions = []
+
+if st.sidebar.button("↩️ Undo Last Shape"):
+    if st.session_state.detected_shapes:
+        st.session_state.detected_shapes.pop()
+        st.session_state.top_predictions = []
+
+st.sidebar.markdown("---")
+st.sidebar.header("🎯 Supported Shapes")
+shape_cols = st.sidebar.columns(2)
+for i, shape in enumerate(SHAPES):
+    emoji = shape_emojis.get(shape, "🔹")
+    shape_cols[i % 2].markdown(f"{emoji} {shape}")
+
+st.sidebar.markdown("---")
+st.sidebar.header("📜 Detected Shapes")
+for i, shape in enumerate(st.session_state.detected_shapes):
+    emoji = shape_emojis.get(shape['name'], "🔹")
+    conf_str = f" ({shape.get('confidence', 0):.0%})" if 'confidence' in shape else ""
+    st.sidebar.markdown(f"""
+        <div class="shape-card">
+            <strong>{emoji} {i+1}. {shape['name']}{conf_str}</strong>
+        </div>
+    """, unsafe_allow_html=True)
+
+# Show top-3 predictions
+if st.session_state.top_predictions:
+    st.sidebar.markdown("---")
+    st.sidebar.header("🔮 Last Prediction (Top 3)")
+    for rank, (name, conf) in enumerate(st.session_state.top_predictions):
+        emoji = shape_emojis.get(name, "🔹")
+        bar = "█" * int(conf * 20) + "░" * (20 - int(conf * 20))
+        st.sidebar.markdown(f"""
+            <div class="prediction-card">
+                <strong>#{rank+1} {emoji} {name}</strong><br>
+                <code>{bar}</code> {conf:.1%}
+            </div>
+        """, unsafe_allow_html=True)
+
+# AI Model
+@st.cache_resource
+def get_ai_model():
+    return load_model()
+
+model = get_ai_model()
+tracker = HandTracker()
+
+# Main Layout
+col1, col2 = st.columns([3, 1])
+
+with col1:
+    st_frame = st.empty()
+
+with col2:
+    st.info("**How to use:**\n1. Start the camera\n2. Use your **index finger** to draw\n3. Keep other fingers closed\n4. When you stop moving or move away, AI classifies the shape\n\n**Supported shapes:**\n" + ", ".join([f"{shape_emojis.get(s, '')} {s}" for s in SHAPES]))
+    prediction_label = st.empty()
+    confidence_bar = st.empty()
+
+# ═══════════════════════════════════════════════════════════════
+# Camera Loop with Improved Inference Pipeline
+# ═══════════════════════════════════════════════════════════════
+
+CLASSIFY_DELAY = 0.5  # seconds to wait after hand disappears before classifying
+MIN_POINTS = 20       # minimum points required for classification
+CONFIDENCE_ACCEPT = 0.55  # 12-class softmax: random=0.083, so 0.55 is strong signal
 CONFIDENCE_UNCERTAIN = 0.35
 
-output_frame = None
-frame_lock = threading.Lock()
-
-
-def camera_loop():
-    global output_frame
+if st.session_state.run_camera:
     cap = cv2.VideoCapture(0)
 
-    while True:
-        with state_lock:
-            if not state["run_camera"]:
-                time.sleep(0.1)
-                continue
-
+    while st.session_state.run_camera:
         ret, frame = cap.read()
         if not ret:
-            time.sleep(0.1)
-            continue
+            st.error("Failed to capture video")
+            break
 
         frame = cv2.flip(frame, 1)
         h, w, c = frame.shape
 
+        # Hand Detection
         results = tracker.find_hand_landmarks(frame)
         cx, cy, landmarks = tracker.get_finger_tip(results, w, h)
 
-        with state_lock:
-            if landmarks:
-                state["hand_disappeared_time"] = None
+        if landmarks:
+            # Reset hand disappearance timer
+            st.session_state.hand_disappeared_time = None
 
-                should_add = True
-                if state["last_point"] is not None:
-                    dx = cx - state["last_point"][0]
-                    dy = cy - state["last_point"][1]
-                    if (dx * dx + dy * dy) < 4:
-                        should_add = False
+            # Point deduplication: skip if too close to last point
+            should_add = True
+            if st.session_state.last_point is not None:
+                dx = cx - st.session_state.last_point[0]
+                dy = cy - st.session_state.last_point[1]
+                if (dx * dx + dy * dy) < 4:  # within 2 pixels
+                    should_add = False
 
-                if should_add:
-                    state["points"].append((cx, cy))
-                    state["last_point"] = (cx, cy)
+            if should_add:
+                st.session_state.points.append((cx, cy))
+                st.session_state.last_point = (cx, cy)
 
-                display_pt = stabilize_drawing_point(state["points"])
-                cv2.circle(frame, display_pt, 15, state["current_color"], -1)
-                cv2.putText(frame, "Drawing...", (display_pt[0] + 20, display_pt[1]),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                tracker.mp_draw.draw_landmarks(frame, landmarks, tracker.mp_hands.HAND_CONNECTIONS)
-            else:
-                if len(state["points"]) > MIN_POINTS:
-                    if state["hand_disappeared_time"] is None:
-                        state["hand_disappeared_time"] = time.time()
+            # Stabilized display point (average of last 3)
+            display_pt = stabilize_drawing_point(st.session_state.points)
+            cv2.circle(frame, display_pt, 15, st.session_state.current_color, -1)
+            cv2.putText(frame, "Drawing...", (display_pt[0] + 20, display_pt[1]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            tracker.mp_draw.draw_landmarks(frame, landmarks, tracker.mp_hands.HAND_CONNECTIONS)
 
-                    elapsed = time.time() - state["hand_disappeared_time"]
+        else:
+            # Hand is gone — start/check delay before classification
+            if len(st.session_state.points) > MIN_POINTS:
+                if st.session_state.hand_disappeared_time is None:
+                    st.session_state.hand_disappeared_time = time.time()
 
-                    if elapsed >= CLASSIFY_DELAY:
-                        processed_pts = smooth_points_ema(state["points"], alpha=0.5)
-                        processed_pts = remove_duplicate_points(processed_pts)
-                        processed_pts = interpolate_gaps(processed_pts)
+                elapsed = time.time() - st.session_state.hand_disappeared_time
 
-                        roi = preprocess_gesture(processed_pts, frame_hw=(h, w))
-                        if roi is not None:
-                            shape_name, confidence, top3 = test_time_augmentation(model, roi, SHAPES)
+                if elapsed >= CLASSIFY_DELAY:
+                    # Preprocess points: smooth first (reduce jitter), then deduplicate, then fill gaps
+                    processed_pts = smooth_points_ema(st.session_state.points, alpha=0.5)
+                    processed_pts = remove_duplicate_points(processed_pts)
+                    processed_pts = interpolate_gaps(processed_pts)
+
+                    roi = preprocess_gesture(processed_pts, frame_hw=(h, w))
+                    if roi is not None:
+                        if demo_mode:
+                            shape_name, confidence = heuristic_classify(processed_pts, frame_hw=(h, w))
+                            top3 = [(shape_name, confidence)]
+                        else:
+                            if use_tta:
+                                # Test-time augmentation for robust prediction
+                                shape_name, confidence, top3 = test_time_augmentation(
+                                    model, roi, SHAPES
+                                )
+                            else:
+                                # Single-pass prediction
+                                preds = model.predict(roi, verbose=0)
+                                class_idx = np.argmax(preds[0])
+                                confidence = float(np.max(preds[0]))
+                                shape_name = SHAPES[class_idx]
+                                top3_idx = np.argsort(preds[0])[::-1][:3]
+                                top3 = [(SHAPES[i], float(preds[0][i])) for i in top3_idx]
+
+                            # Geometric disambiguation for uncertain predictions
                             shape_name, confidence, top3 = geometric_disambiguate(
                                 processed_pts, shape_name, confidence, top3
                             )
 
-                            state["top_predictions"] = top3
-                            emoji = SHAPE_EMOJIS.get(shape_name, "")
+                        st.session_state.top_predictions = top3
 
-                            if confidence >= CONFIDENCE_ACCEPT:
-                                state["detected_shapes"].append({
-                                    "name": shape_name,
-                                    "points": state["points"].copy(),
-                                    "color": state["current_color"],
-                                    "confidence": confidence
-                                })
-                                state["last_result"] = {
-                                    "shape": shape_name,
-                                    "emoji": emoji,
-                                    "confidence": round(confidence * 100, 1),
-                                    "top3": [
-                                        {"name": n, "emoji": SHAPE_EMOJIS.get(n, ""), "confidence": round(c * 100, 1)}
-                                        for n, c in top3
-                                    ],
-                                    "accepted": True,
-                                    "status": "accepted"
-                                }
-                            elif confidence >= CONFIDENCE_UNCERTAIN:
-                                state["last_result"] = {
-                                    "shape": shape_name,
-                                    "emoji": emoji,
-                                    "confidence": round(confidence * 100, 1),
-                                    "top3": [
-                                        {"name": n, "emoji": SHAPE_EMOJIS.get(n, ""), "confidence": round(c * 100, 1)}
-                                        for n, c in top3
-                                    ],
-                                    "accepted": False,
-                                    "status": "uncertain"
-                                }
-                            else:
-                                state["last_result"] = {
-                                    "shape": "Unknown",
-                                    "emoji": "?",
-                                    "confidence": round(confidence * 100, 1),
-                                    "top3": [],
-                                    "accepted": False,
-                                    "status": "unknown"
-                                }
+                        # Confidence thresholding
+                        emoji = shape_emojis.get(shape_name, "🔹")
+                        if confidence >= CONFIDENCE_ACCEPT:
+                            st.session_state.detected_shapes.append({
+                                "name": shape_name,
+                                "points": st.session_state.points.copy(),
+                                "color": st.session_state.current_color,
+                                "confidence": confidence
+                            })
+                            prediction_label.success(
+                                f"{emoji} Detected: **{shape_name}** ({confidence:.1%})"
+                            )
+                            confidence_bar.progress(confidence)
+                        elif confidence >= CONFIDENCE_UNCERTAIN:
+                            top2_str = " / ".join(
+                                [f"{shape_emojis.get(n, '')} {n} ({c:.0%})" for n, c in top3[:2]]
+                            )
+                            prediction_label.warning(f"🤔 Uncertain: {top2_str}")
+                            confidence_bar.progress(confidence)
+                        else:
+                            prediction_label.error("❓ Unknown shape — try drawing more clearly")
+                            confidence_bar.progress(confidence)
+                    else:
+                        prediction_label.error("❓ Drawing too small — try drawing larger")
 
-                        state["points"] = []
-                        state["last_point"] = None
-                        state["hand_disappeared_time"] = None
-                else:
-                    if state["hand_disappeared_time"] is not None:
-                        elapsed = time.time() - state["hand_disappeared_time"]
-                        if elapsed >= CLASSIFY_DELAY + 0.5:
-                            state["points"] = []
-                            state["last_point"] = None
-                            state["hand_disappeared_time"] = None
+                    st.session_state.points = []
+                    st.session_state.last_point = None
+                    st.session_state.hand_disappeared_time = None
+            else:
+                # Not enough points, reset
+                if st.session_state.hand_disappeared_time is not None:
+                    elapsed = time.time() - st.session_state.hand_disappeared_time
+                    if elapsed >= CLASSIFY_DELAY + 0.5:
+                        st.session_state.points = []
+                        st.session_state.last_point = None
+                        st.session_state.hand_disappeared_time = None
 
-            # Draw current points
-            for i in range(1, len(state["points"])):
-                cv2.line(frame, state["points"][i-1], state["points"][i],
-                         state["current_color"], 4)
+        # Draw current points
+        for i in range(1, len(st.session_state.points)):
+            cv2.line(frame, st.session_state.points[i-1], st.session_state.points[i],
+                     st.session_state.current_color, 4)
 
-            # Draw detected shapes
-            for shape in state["detected_shapes"]:
-                frame = draw_perfect_shape(frame, shape['name'], shape['color'], shape['points'])
+        # Draw all previously detected shapes
+        for shape in st.session_state.detected_shapes:
+            frame = draw_perfect_shape(frame, shape['name'], shape['color'], shape['points'])
 
-        # Encode frame as JPEG for streaming
-        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        with frame_lock:
-            output_frame = buffer.tobytes()
+        # Display Frame
+        st_frame.image(frame, channels="BGR", use_container_width=True)
 
+        # Small sleep to reduce CPU usage
         time.sleep(0.01)
 
     cap.release()
-
-
-# ═══════════════════════════════════════════════════════════════
-# Flask Routes
-# ═══════════════════════════════════════════════════════════════
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-def generate_frames():
-    global output_frame
-    while True:
-        with frame_lock:
-            if output_frame is None:
-                time.sleep(0.05)
-                continue
-            frame = output_frame
-
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.03)
-
-
-@app.route("/video_feed")
-def video_feed():
-    return Response(generate_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-@app.route("/api/start", methods=["POST"])
-def start_camera():
-    with state_lock:
-        state["run_camera"] = True
-    return jsonify({"status": "started"})
-
-
-@app.route("/api/stop", methods=["POST"])
-def stop_camera():
-    with state_lock:
-        state["run_camera"] = False
-    return jsonify({"status": "stopped"})
-
-
-@app.route("/api/clear", methods=["POST"])
-def clear_canvas():
-    with state_lock:
-        state["points"] = []
-        state["detected_shapes"] = []
-        state["top_predictions"] = []
-        state["last_point"] = None
-        state["last_result"] = None
-    return jsonify({"status": "cleared"})
-
-
-@app.route("/api/undo", methods=["POST"])
-def undo_shape():
-    with state_lock:
-        if state["detected_shapes"]:
-            state["detected_shapes"].pop()
-    return jsonify({"status": "undone", "remaining": len(state["detected_shapes"])})
-
-
-@app.route("/api/color", methods=["POST"])
-def set_color():
-    data = request.get_json()
-    hex_color = data.get("color", "#00FF88").lstrip('#')
-    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
-    with state_lock:
-        state["current_color"] = (r, g, b)
-    return jsonify({"status": "ok"})
-
-
-@app.route("/api/state")
-def get_state():
-    with state_lock:
-        return jsonify({
-            "running": state["run_camera"],
-            "num_points": len(state["points"]),
-            "num_shapes": len(state["detected_shapes"]),
-            "shapes": [
-                {
-                    "name": s["name"],
-                    "confidence": round(s.get("confidence", 0) * 100, 1),
-                    "emoji": SHAPE_EMOJIS.get(s["name"], "")
-                }
-                for s in state["detected_shapes"]
-            ],
-            "last_result": state["last_result"],
-            "top_predictions": [
-                {"name": n, "emoji": SHAPE_EMOJIS.get(n, ""), "confidence": round(c * 100, 1)}
-                for n, c in state.get("top_predictions", [])
-            ]
-        })
-
-
-if __name__ == "__main__":
-    # Start camera thread
-    cam_thread = threading.Thread(target=camera_loop, daemon=True)
-    cam_thread.start()
-
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+else:
+    st.write("Camera is off. Click '▶️ Start Camera' in the sidebar to begin.")
