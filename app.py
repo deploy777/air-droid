@@ -350,7 +350,17 @@ shared = SharedState()
 # WebRTC Video Frame Callback (runs in separate thread)
 # ═══════════════════════════════════════════════════════════════
 
-tracker = HandTracker()
+# Lazy-init tracker (only created once, not on every Streamlit rerun)
+_tracker_lock = threading.Lock()
+_tracker_instance = None
+
+def _get_tracker():
+    global _tracker_instance
+    if _tracker_instance is None:
+        with _tracker_lock:
+            if _tracker_instance is None:
+                _tracker_instance = HandTracker()
+    return _tracker_instance
 
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     img = frame.to_ndarray(format="bgr24")
@@ -360,7 +370,8 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     with shared.lock:
         current_color = shared.drawing_color
 
-    # Hand Detection
+    # Hand Detection (lazy init)
+    tracker = _get_tracker()
     results = tracker.find_hand_landmarks(img)
     cx, cy, landmarks = tracker.get_finger_tip(results, w, h)
 
@@ -503,7 +514,7 @@ with col2:
     prediction_label = st.empty()
     confidence_bar = st.empty()
 
-# Poll shared state for results
+# Poll shared state for results (no st.rerun to avoid overload)
 if ctx.state.playing:
     with shared.lock:
         result = shared.result
@@ -523,7 +534,3 @@ if ctx.state.playing:
 
     st.session_state.top_predictions = top_preds
     st.session_state.detected_shapes = det_shapes
-
-    # Auto-refresh to pick up new results
-    time.sleep(0.5)
-    st.rerun()
