@@ -166,36 +166,135 @@ function preprocessDrawing(points, canvasW, canvasH) {
     return input;
 }
 
-// ═══ TFLite Inference ═══
+// ═══ Point Processing (matches app.py exactly) ═══
+function removeDuplicatePoints(points, minDist = 3) {
+    if (points.length < 2) return points;
+    const filtered = [points[0]];
+    for (let i = 1; i < points.length; i++) {
+        const dx = points[i][0] - filtered[filtered.length-1][0];
+        const dy = points[i][1] - filtered[filtered.length-1][1];
+        if (dx*dx + dy*dy > minDist*minDist) filtered.push(points[i]);
+    }
+    return filtered;
+}
+
+function interpolateGaps(points, maxGap = 20) {
+    if (points.length < 2) return points;
+    const result = [points[0]];
+    for (let i = 1; i < points.length; i++) {
+        const dx = points[i][0] - points[i-1][0];
+        const dy = points[i][1] - points[i-1][1];
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist > maxGap) {
+            const n = Math.floor(dist / maxGap);
+            for (let j = 1; j <= n; j++) {
+                const t = j / (n + 1);
+                result.push([Math.round(points[i-1][0] + t*dx), Math.round(points[i-1][1] + t*dy)]);
+            }
+        }
+        result.push(points[i]);
+    }
+    return result;
+}
+
+function geometricDisambiguate(points, cnnShape, cnnConf, top3) {
+    if (cnnConf > 0.75 || points.length < 15) return { shape: cnnShape, conf: cnnConf };
+
+    // Bounding box
+    let minX=9999, minY=9999, maxX=0, maxY=0;
+    for (const p of points) { minX=Math.min(minX,p[0]); minY=Math.min(minY,p[1]); maxX=Math.max(maxX,p[0]); maxY=Math.max(maxY,p[1]); }
+    const bw = maxX-minX, bh = maxY-minY;
+    const aspect = bw / Math.max(bh, 1);
+
+    // Closed path check
+    const startEnd = Math.sqrt((points[0][0]-points[points.length-1][0])**2 + (points[0][1]-points[points.length-1][1])**2);
+    const maxExtent = Math.max(bw, bh);
+
+    // Self-crossings
+    let crossings = 0;
+    const segs = points.length - 1;
+    if (segs > 10) {
+        const step = Math.max(1, Math.floor(segs / 30));
+        for (let i = 0; i < segs - 2; i += step) {
+            for (let j = i + 2; j < Math.min(segs, i + 20); j += step) {
+                const p1=points[i], p2=points[i+1], p3=points[j], p4=points[j+1];
+                const d1=(p4[0]-p3[0])*(p1[1]-p3[1])-(p4[1]-p3[1])*(p1[0]-p3[0]);
+                const d2=(p4[0]-p3[0])*(p2[1]-p3[1])-(p4[1]-p3[1])*(p2[0]-p3[0]);
+                const d3=(p2[0]-p1[0])*(p3[1]-p1[1])-(p2[1]-p1[1])*(p3[0]-p1[0]);
+                const d4=(p2[0]-p1[0])*(p4[1]-p1[1])-(p2[1]-p1[1])*(p4[0]-p1[0]);
+                if (d1*d2 < 0 && d3*d4 < 0) crossings++;
+            }
+        }
+    }
+
+    // Radius trend (spiral detection)
+    let cx=0, cy=0;
+    for (const p of points) { cx+=p[0]; cy+=p[1]; }
+    cx/=points.length; cy/=points.length;
+    const radii = points.map(p => Math.sqrt((p[0]-cx)**2 + (p[1]-cy)**2));
+    let sumXY=0, sumX=0, sumY=0, sumX2=0, n=radii.length;
+    for (let i=0; i<n; i++) { sumX+=i; sumY+=radii[i]; sumXY+=i*radii[i]; sumX2+=i*i; }
+    const radiusTrend = (n*sumXY - sumX*sumY) / Math.sqrt((n*sumX2 - sumX*sumX) * (n*radii.reduce((a,b)=>a+b*b,0) - sumY*sumY) || 1);
+
+    const top2 = top3.slice(0, 2).map(t => t.name);
+
+    // Spiral vs Infinity
+    if (top2.includes('Spiral') || top2.includes('Infinity')) {
+        if (crossings > 2 && Math.abs(radiusTrend) < 0.5) {
+            if (cnnShape !== 'Infinity') return { shape: 'Infinity', conf: Math.max(cnnConf, 0.6) };
+        } else if (Math.abs(radiusTrend) > 0.6 && crossings <= 1) {
+            if (cnnShape !== 'Spiral') return { shape: 'Spiral', conf: Math.max(cnnConf, 0.6) };
+        }
+    }
+    // Lightning vs Crown
+    if (top2.includes('Lightning bolt') || top2.includes('Crown')) {
+        if (aspect < 0.6 && cnnShape !== 'Lightning bolt') return { shape: 'Lightning bolt', conf: Math.max(cnnConf, 0.6) };
+        if (aspect > 1.5 && cnnShape !== 'Crown') return { shape: 'Crown', conf: Math.max(cnnConf, 0.6) };
+    }
+    return { shape: cnnShape, conf: cnnConf };
+}
+
+// ═══ TFLite Inference (matches app.py TTA exactly) ═══
 async function classifyShape(points, canvasW, canvasH) {
     if (!tfliteModel || points.length < MIN_POINTS) return null;
     
-    // Smooth points (EMA)
-    const smoothed = smoothPointsEMA(points, 0.5);
-    const processed = preprocessDrawing(smoothed, canvasW, canvasH);
-    if (!processed) return null;
+    // Preprocess: smooth -> dedup -> interpolate (same as app.py)
+    let processed = smoothPointsEMA(points, 0.5);
+    processed = removeDuplicatePoints(processed);
+    processed = interpolateGaps(processed);
     
-    // Run inference with augmentations (TTA)
+    const inputData = preprocessDrawing(processed, canvasW, canvasH);
+    if (!inputData) return null;
+    
+    // Full TTA: 7 rotations + 2 scales + 1 noise = 10 augmentations (same as app.py)
     const allPreds = [];
     
-    // Original
-    const pred0 = await runInference(processed);
-    if (pred0) allPreds.push(pred0);
-    
-    // Rotations: -10, -5, 5, 10 degrees
-    for (const angle of [-10, -5, 5, 10]) {
-        const rotated = rotateImage(processed, angle);
-        const p = await runInference(rotated);
+    for (const angle of [-15, -10, -5, 0, 5, 10, 15]) {
+        const aug = angle === 0 ? inputData : rotateImage(inputData, angle);
+        const p = await runInference(aug);
         if (p) allPreds.push(p);
     }
+    
+    // Scale augmentations
+    for (const scale of [0.9, 1.1]) {
+        const scaled = scaleImage(inputData, scale);
+        const p = await runInference(scaled);
+        if (p) allPreds.push(p);
+    }
+    
+    // Noise augmentation
+    const noisy = new Float32Array(inputData.length);
+    for (let i = 0; i < inputData.length; i++) {
+        noisy[i] = Math.max(0, Math.min(1, inputData[i] + (Math.random() - 0.5) * 0.1));
+    }
+    const pn = await runInference(noisy);
+    if (pn) allPreds.push(pn);
     
     if (allPreds.length === 0) return null;
     
     // Average predictions
     const avg = new Float32Array(12).fill(0);
-    for (const p of allPreds) {
-        for (let i = 0; i < 12; i++) avg[i] += p[i];
-    }
+    for (const p of allPreds) { for (let i = 0; i < 12; i++) avg[i] += p[i]; }
     for (let i = 0; i < 12; i++) avg[i] /= allPreds.length;
     
     // Top 3
@@ -206,13 +305,21 @@ async function classifyShape(points, canvasW, canvasH) {
         confidence: Math.round(avg[i] * 1000) / 10
     }));
     
-    const best = top3[0];
+    let bestShape = top3[0].name;
+    let bestConf = avg[indices[0]];
+    
+    // Geometric disambiguation (same as app.py)
+    const disamb = geometricDisambiguate(processed, bestShape, bestConf, top3);
+    bestShape = disamb.shape;
+    bestConf = disamb.conf;
+    const bestConfPct = Math.round(bestConf * 1000) / 10;
+    
     return {
-        shape: best.name,
-        emoji: best.emoji,
-        confidence: best.confidence,
+        shape: bestShape,
+        emoji: SHAPE_EMOJIS[bestShape],
+        confidence: bestConfPct,
         top3: top3,
-        accepted: (best.confidence / 100) >= CONFIDENCE_ACCEPT
+        accepted: bestConf >= CONFIDENCE_ACCEPT
     };
 }
 
@@ -259,6 +366,22 @@ function rotateImage(data, angleDeg) {
         }
     }
     return rotated;
+}
+
+function scaleImage(data, scale) {
+    const size = 128;
+    const cx = size / 2, cy = size / 2;
+    const scaled = new Float32Array(size * size);
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+            const sx = Math.round((x - cx) / scale + cx);
+            const sy = Math.round((y - cy) / scale + cy);
+            if (sx >= 0 && sx < size && sy >= 0 && sy < size) {
+                scaled[y * size + x] = data[sy * size + sx];
+            }
+        }
+    }
+    return scaled;
 }
 
 // ═══ MediaPipe Hands ═══
