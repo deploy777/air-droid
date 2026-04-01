@@ -1,0 +1,10 @@
+app.py
+model.py
+utils.py
+requirements.txt
+*.h5
+*.py
+static/
+templates/
+__pycache__/
+.git/
