@@ -1,12 +1,16 @@
 import streamlit as st
 import cv2
+import av
 import numpy as np
+import time
+import threading
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
 from utils import HandTracker, preprocess_gesture, draw_perfect_shape, heuristic_classify
 from model import load_model, SHAPES
-import time
 
 # ═══════════════════════════════════════════════════════════════
 # Helper Functions for Improved Inference Pipeline
+# (IDENTICAL to original app.py — no changes)
 # ═══════════════════════════════════════════════════════════════
 
 def smooth_points_ema(points, alpha=0.4):
@@ -249,46 +253,31 @@ shape_emojis = {
 }
 
 # Initialize Session State
-if 'run_camera' not in st.session_state:
-    st.session_state.run_camera = False
-if 'drawing' not in st.session_state:
-    st.session_state.drawing = False
-if 'points' not in st.session_state:
-    st.session_state.points = []
 if 'detected_shapes' not in st.session_state:
     st.session_state.detected_shapes = []
 if 'current_color' not in st.session_state:
-    st.session_state.current_color = (0, 255, 0)  # Green
-if 'hand_disappeared_time' not in st.session_state:
-    st.session_state.hand_disappeared_time = None
+    st.session_state.current_color = (0, 255, 0)
 if 'top_predictions' not in st.session_state:
     st.session_state.top_predictions = []
-if 'last_point' not in st.session_state:
-    st.session_state.last_point = None
+if 'last_result' not in st.session_state:
+    st.session_state.last_result = None
 
 # Sidebar
 st.sidebar.header("🎮 Controls")
-
-col_start, col_stop = st.sidebar.columns(2)
-if col_start.button("▶️ Start Camera"):
-    st.session_state.run_camera = True
-if col_stop.button("⏹️ Stop Camera"):
-    st.session_state.run_camera = False
-
 color_picker = st.sidebar.color_picker("Pick a Shape Fill Color", "#00FF00")
-st.sidebar.markdown("---")
-demo_mode = st.sidebar.checkbox("Use Heuristic Fallback", value=False, help="Uses geometric heuristics instead of the AI model. AI model is more advanced (CNN+Transformer).")
-use_tta = st.sidebar.checkbox("Use Test-Time Augmentation", value=True, help="Averages multiple predictions for more robust classification. Slightly slower but more accurate.")
-
-st.sidebar.markdown("---")
-# Convert hex to RGB
 hex_color = color_picker.lstrip('#')
 st.session_state.current_color = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
+st.sidebar.markdown("---")
+demo_mode = st.sidebar.checkbox("Use Heuristic Fallback", value=False,
+    help="Uses geometric heuristics instead of the AI model. AI model is more advanced (CNN+Transformer).")
+use_tta = st.sidebar.checkbox("Use Test-Time Augmentation", value=True,
+    help="Averages multiple predictions for more robust classification. Slightly slower but more accurate.")
+
 if st.sidebar.button("🧹 Clear Canvas"):
-    st.session_state.points = []
     st.session_state.detected_shapes = []
     st.session_state.top_predictions = []
+    st.session_state.last_result = None
 
 if st.sidebar.button("↩️ Undo Last Shape"):
     if st.session_state.detected_shapes:
@@ -333,160 +322,208 @@ def get_ai_model():
     return load_model()
 
 model = get_ai_model()
-tracker = HandTracker()
-
-# Main Layout
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    st_frame = st.empty()
-
-with col2:
-    st.info("**How to use:**\n1. Start the camera\n2. Use your **index finger** to draw\n3. Keep other fingers closed\n4. When you stop moving or move away, AI classifies the shape\n\n**Supported shapes:**\n" + ", ".join([f"{shape_emojis.get(s, '')} {s}" for s in SHAPES]))
-    prediction_label = st.empty()
-    confidence_bar = st.empty()
 
 # ═══════════════════════════════════════════════════════════════
-# Camera Loop with Improved Inference Pipeline
+# Shared State for WebRTC callback thread
 # ═══════════════════════════════════════════════════════════════
 
-CLASSIFY_DELAY = 0.5  # seconds to wait after hand disappears before classifying
-MIN_POINTS = 20       # minimum points required for classification
-CONFIDENCE_ACCEPT = 0.55  # 12-class softmax: random=0.083, so 0.55 is strong signal
+CLASSIFY_DELAY = 0.5
+MIN_POINTS = 20
+CONFIDENCE_ACCEPT = 0.55
 CONFIDENCE_UNCERTAIN = 0.35
 
-if st.session_state.run_camera:
-    cap = cv2.VideoCapture(0)
+# Thread-safe shared state
+class SharedState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.points = []
+        self.last_point = None
+        self.hand_disappeared_time = None
+        self.detected_shapes = []
+        self.result = None
+        self.top_predictions = []
+        self.drawing_color = (0, 255, 0)
 
-    while st.session_state.run_camera:
-        ret, frame = cap.read()
-        if not ret:
-            st.error("Failed to capture video")
-            break
+shared = SharedState()
 
-        frame = cv2.flip(frame, 1)
-        h, w, c = frame.shape
+# ═══════════════════════════════════════════════════════════════
+# WebRTC Video Frame Callback (runs in separate thread)
+# ═══════════════════════════════════════════════════════════════
 
-        # Hand Detection
-        results = tracker.find_hand_landmarks(frame)
-        cx, cy, landmarks = tracker.get_finger_tip(results, w, h)
+tracker = HandTracker()
 
-        if landmarks:
-            # Reset hand disappearance timer
-            st.session_state.hand_disappeared_time = None
+def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+    img = frame.to_ndarray(format="bgr24")
+    img = cv2.flip(img, 1)
+    h, w, c = img.shape
 
-            # Point deduplication: skip if too close to last point
+    with shared.lock:
+        current_color = shared.drawing_color
+
+    # Hand Detection
+    results = tracker.find_hand_landmarks(img)
+    cx, cy, landmarks = tracker.get_finger_tip(results, w, h)
+
+    if landmarks:
+        with shared.lock:
+            shared.hand_disappeared_time = None
+
+            # Point deduplication
             should_add = True
-            if st.session_state.last_point is not None:
-                dx = cx - st.session_state.last_point[0]
-                dy = cy - st.session_state.last_point[1]
-                if (dx * dx + dy * dy) < 4:  # within 2 pixels
+            if shared.last_point is not None:
+                dx = cx - shared.last_point[0]
+                dy = cy - shared.last_point[1]
+                if (dx * dx + dy * dy) < 4:
                     should_add = False
 
             if should_add:
-                st.session_state.points.append((cx, cy))
-                st.session_state.last_point = (cx, cy)
+                shared.points.append((cx, cy))
+                shared.last_point = (cx, cy)
 
-            # Stabilized display point (average of last 3)
-            display_pt = stabilize_drawing_point(st.session_state.points)
-            cv2.circle(frame, display_pt, 15, st.session_state.current_color, -1)
-            cv2.putText(frame, "Drawing...", (display_pt[0] + 20, display_pt[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            tracker.mp_draw.draw_landmarks(frame, landmarks, tracker.mp_hands.HAND_CONNECTIONS)
+            display_pt = stabilize_drawing_point(shared.points)
 
-        else:
-            # Hand is gone — start/check delay before classification
-            if len(st.session_state.points) > MIN_POINTS:
-                if st.session_state.hand_disappeared_time is None:
-                    st.session_state.hand_disappeared_time = time.time()
+        cv2.circle(img, display_pt, 15, current_color, -1)
+        cv2.putText(img, "Drawing...", (display_pt[0] + 20, display_pt[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        tracker.mp_draw.draw_landmarks(img, landmarks, tracker.mp_hands.HAND_CONNECTIONS)
 
-                elapsed = time.time() - st.session_state.hand_disappeared_time
+    else:
+        with shared.lock:
+            num_points = len(shared.points)
+            hand_time = shared.hand_disappeared_time
 
-                if elapsed >= CLASSIFY_DELAY:
-                    # Preprocess points: smooth first (reduce jitter), then deduplicate, then fill gaps
-                    processed_pts = smooth_points_ema(st.session_state.points, alpha=0.5)
-                    processed_pts = remove_duplicate_points(processed_pts)
-                    processed_pts = interpolate_gaps(processed_pts)
+        if num_points > MIN_POINTS:
+            if hand_time is None:
+                with shared.lock:
+                    shared.hand_disappeared_time = time.time()
+                hand_time = time.time()
 
-                    roi = preprocess_gesture(processed_pts, frame_hw=(h, w))
-                    if roi is not None:
-                        if demo_mode:
-                            shape_name, confidence = heuristic_classify(processed_pts, frame_hw=(h, w))
-                            top3 = [(shape_name, confidence)]
-                        else:
-                            if use_tta:
-                                # Test-time augmentation for robust prediction
-                                shape_name, confidence, top3 = test_time_augmentation(
-                                    model, roi, SHAPES
-                                )
-                            else:
-                                # Single-pass prediction
-                                preds = model.predict(roi, verbose=0)
-                                class_idx = np.argmax(preds[0])
-                                confidence = float(np.max(preds[0]))
-                                shape_name = SHAPES[class_idx]
-                                top3_idx = np.argsort(preds[0])[::-1][:3]
-                                top3 = [(SHAPES[i], float(preds[0][i])) for i in top3_idx]
+            elapsed = time.time() - hand_time
 
-                            # Geometric disambiguation for uncertain predictions
-                            shape_name, confidence, top3 = geometric_disambiguate(
-                                processed_pts, shape_name, confidence, top3
+            if elapsed >= CLASSIFY_DELAY:
+                with shared.lock:
+                    pts_copy = shared.points.copy()
+                    shared.points = []
+                    shared.last_point = None
+                    shared.hand_disappeared_time = None
+
+                # Preprocess points
+                processed_pts = smooth_points_ema(pts_copy, alpha=0.5)
+                processed_pts = remove_duplicate_points(processed_pts)
+                processed_pts = interpolate_gaps(processed_pts)
+
+                roi = preprocess_gesture(processed_pts, frame_hw=(h, w))
+                if roi is not None:
+                    if demo_mode:
+                        shape_name, confidence = heuristic_classify(processed_pts, frame_hw=(h, w))
+                        top3 = [(shape_name, confidence)]
+                    else:
+                        if use_tta:
+                            shape_name, confidence, top3 = test_time_augmentation(
+                                model, roi, SHAPES
                             )
+                        else:
+                            preds = model.predict(roi, verbose=0)
+                            class_idx = np.argmax(preds[0])
+                            confidence = float(np.max(preds[0]))
+                            shape_name = SHAPES[class_idx]
+                            top3_idx = np.argsort(preds[0])[::-1][:3]
+                            top3 = [(SHAPES[i], float(preds[0][i])) for i in top3_idx]
 
-                        st.session_state.top_predictions = top3
+                        shape_name, confidence, top3 = geometric_disambiguate(
+                            processed_pts, shape_name, confidence, top3
+                        )
 
-                        # Confidence thresholding
+                    with shared.lock:
+                        shared.top_predictions = top3
+
                         emoji = shape_emojis.get(shape_name, "🔹")
                         if confidence >= CONFIDENCE_ACCEPT:
-                            st.session_state.detected_shapes.append({
+                            shared.detected_shapes.append({
                                 "name": shape_name,
-                                "points": st.session_state.points.copy(),
-                                "color": st.session_state.current_color,
+                                "points": pts_copy,
+                                "color": current_color,
                                 "confidence": confidence
                             })
-                            prediction_label.success(
-                                f"{emoji} Detected: **{shape_name}** ({confidence:.1%})"
-                            )
-                            confidence_bar.progress(confidence)
+                            shared.result = ("success", f"{emoji} Detected: **{shape_name}** ({confidence:.1%})", confidence)
                         elif confidence >= CONFIDENCE_UNCERTAIN:
                             top2_str = " / ".join(
                                 [f"{shape_emojis.get(n, '')} {n} ({c:.0%})" for n, c in top3[:2]]
                             )
-                            prediction_label.warning(f"🤔 Uncertain: {top2_str}")
-                            confidence_bar.progress(confidence)
+                            shared.result = ("warning", f"🤔 Uncertain: {top2_str}", confidence)
                         else:
-                            prediction_label.error("❓ Unknown shape — try drawing more clearly")
-                            confidence_bar.progress(confidence)
-                    else:
-                        prediction_label.error("❓ Drawing too small — try drawing larger")
-
-                    st.session_state.points = []
-                    st.session_state.last_point = None
-                    st.session_state.hand_disappeared_time = None
-            else:
-                # Not enough points, reset
-                if st.session_state.hand_disappeared_time is not None:
-                    elapsed = time.time() - st.session_state.hand_disappeared_time
+                            shared.result = ("error", "❓ Unknown shape — try drawing more clearly", confidence)
+                else:
+                    with shared.lock:
+                        shared.result = ("error", "❓ Drawing too small — try drawing larger", 0)
+        else:
+            with shared.lock:
+                if shared.hand_disappeared_time is not None:
+                    elapsed = time.time() - shared.hand_disappeared_time
                     if elapsed >= CLASSIFY_DELAY + 0.5:
-                        st.session_state.points = []
-                        st.session_state.last_point = None
-                        st.session_state.hand_disappeared_time = None
+                        shared.points = []
+                        shared.last_point = None
+                        shared.hand_disappeared_time = None
 
-        # Draw current points
-        for i in range(1, len(st.session_state.points)):
-            cv2.line(frame, st.session_state.points[i-1], st.session_state.points[i],
-                     st.session_state.current_color, 4)
+    # Draw current points
+    with shared.lock:
+        pts_draw = shared.points.copy()
+        shapes_draw = shared.detected_shapes.copy()
 
-        # Draw all previously detected shapes
-        for shape in st.session_state.detected_shapes:
-            frame = draw_perfect_shape(frame, shape['name'], shape['color'], shape['points'])
+    for i in range(1, len(pts_draw)):
+        cv2.line(img, pts_draw[i-1], pts_draw[i], current_color, 4)
 
-        # Display Frame
-        st_frame.image(frame, channels="BGR", use_container_width=True)
+    # Draw all previously detected shapes
+    for shape in shapes_draw:
+        img = draw_perfect_shape(img, shape['name'], shape['color'], shape['points'])
 
-        # Small sleep to reduce CPU usage
-        time.sleep(0.01)
+    return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-    cap.release()
-else:
-    st.write("Camera is off. Click '▶️ Start Camera' in the sidebar to begin.")
+
+# ═══════════════════════════════════════════════════════════════
+# Main Layout
+# ═══════════════════════════════════════════════════════════════
+
+col1, col2 = st.columns([3, 1])
+
+with col1:
+    ctx = webrtc_streamer(
+        key="air-canvas",
+        mode=WebRtcMode.SENDRECV,
+        video_frame_callback=video_frame_callback,
+        media_stream_constraints={"video": True, "audio": False},
+        rtc_configuration={
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        },
+        async_processing=True,
+    )
+
+with col2:
+    st.info("**How to use:**\n1. Click START to enable camera\n2. Use your **index finger** to draw\n3. Keep other fingers closed\n4. When you stop moving or move away, AI classifies the shape\n\n**Supported shapes:**\n" + ", ".join([f"{shape_emojis.get(s, '')} {s}" for s in SHAPES]))
+    prediction_label = st.empty()
+    confidence_bar = st.empty()
+
+# Poll shared state for results
+if ctx.state.playing:
+    with shared.lock:
+        result = shared.result
+        top_preds = shared.top_predictions.copy()
+        det_shapes = shared.detected_shapes.copy()
+        shared.drawing_color = st.session_state.current_color
+
+    if result:
+        level, msg, conf = result
+        if level == "success":
+            prediction_label.success(msg)
+        elif level == "warning":
+            prediction_label.warning(msg)
+        else:
+            prediction_label.error(msg)
+        confidence_bar.progress(min(conf, 1.0))
+
+    st.session_state.top_predictions = top_preds
+    st.session_state.detected_shapes = det_shapes
+
+    # Auto-refresh to pick up new results
+    time.sleep(0.5)
+    st.rerun()
